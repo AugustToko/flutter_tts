@@ -5,7 +5,6 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -13,11 +12,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
-import android.provider.OpenableColumns
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
-import io.flutter.Log
+import android.util.Log
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
@@ -55,7 +53,6 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var queueMode: Int = TextToSpeech.QUEUE_FLUSH
     private var ttsStatus: Int? = null
     private var selectedEngine: String? = null
-    private var engineResult: Result? = null
     private var parcelFileDescriptor: ParcelFileDescriptor? = null
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -71,7 +68,6 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         methodChannel!!.setMethodCallHandler(this)
         handler = Handler(Looper.getMainLooper())
         bundle = Bundle()
-        tts = TextToSpeech(context, onInitListenerWithoutCallback)
     }
 
     /** Android Plugin APIs  */
@@ -214,37 +210,6 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         }
     }
 
-    private val onInitListenerWithCallback: TextToSpeech.OnInitListener =
-        TextToSpeech.OnInitListener { status ->
-            // Handle pending method calls (sent while TTS was initializing)
-            synchronized(this@FlutterTtsPlugin) {
-                ttsStatus = status
-                for (call in pendingMethodCalls) {
-                    call.run()
-                }
-                pendingMethodCalls.clear()
-            }
-
-            if (status == TextToSpeech.SUCCESS) {
-                tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
-                try {
-                    val locale: Locale = tts!!.defaultVoice.locale
-                    if (isLanguageAvailable(locale)) {
-                        tts!!.language = locale
-                    }
-                } catch (e: NullPointerException) {
-                    Log.e(tag, "getDefaultLocale: " + e.message)
-                } catch (e: IllegalArgumentException) {
-                    Log.e(tag, "getDefaultLocale: " + e.message)
-                }
-
-                engineResult!!.success(1)
-            } else {
-                engineResult!!.error("TtsError","Failed to initialize TextToSpeech with status: $status", null)
-            }
-            //engineResult = null
-        }
-
     private val onInitListenerWithoutCallback: TextToSpeech.OnInitListener =
         TextToSpeech.OnInitListener { status ->
             // Handle pending method calls (sent while TTS was initializing)
@@ -274,15 +239,6 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
-        // If TTS is still loading
-        synchronized(this@FlutterTtsPlugin) {
-            if (ttsStatus == null) {
-                // Suspend method call until the TTS engine is ready
-                val suspendedCall = Runnable { onMethodCall(call, result) }
-                pendingMethodCalls.add(suspendedCall)
-                return
-            }
-        }
         when (call.method) {
             "speak" -> {
                 var text: String = call.argument("text")!!
@@ -384,7 +340,55 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
             "setEngine" -> {
                 val engine: String = call.arguments.toString()
-                setEngine(engine, result)
+                ttsStatus = null
+                selectedEngine = engine
+                Log.d(tag, "init tts instance($engine) ...")
+                tts = TextToSpeech(
+                    context,
+                    { status ->
+                        Log.d(tag, "tts on listener callback ($status)")
+                        // Handle pending method calls (sent while TTS was initializing)
+                        synchronized(this@FlutterTtsPlugin) {
+                            ttsStatus = status
+                            for (call in pendingMethodCalls) {
+                                call.run()
+                            }
+                            pendingMethodCalls.clear()
+                        }
+
+                        if (status == TextToSpeech.SUCCESS) {
+                            tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
+                            try {
+                                val locale: Locale? = tts!!.defaultVoice?.locale
+                                if (locale == null) {
+                                    result.success(0)
+                                    return@TextToSpeech
+                                }
+
+                                if (isLanguageAvailable(locale)) {
+                                    tts!!.language = locale
+                                }
+                            } catch (e: Exception) {
+                                Log.e(tag, "exception on initialized: " + e.message)
+                                result.error(
+                                    "TtsError",
+                                    "Failed to initialize TextToSpeech with status: $status",
+                                    e
+                                )
+                                return@TextToSpeech
+                            }
+
+                            result.success(1)
+                        } else {
+                            result.error(
+                                "TtsError",
+                                "Failed to initialize TextToSpeech with status: $status",
+                                null
+                            )
+                        }
+                    },
+                    engine,
+                )
             }
 
             "setSpeechRate" -> {
@@ -492,13 +496,6 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
         }
         return false
-    }
-
-    private fun setEngine(engine: String?, result: Result) {
-        ttsStatus = null
-        selectedEngine = engine
-        engineResult = result
-        tts = TextToSpeech(context, onInitListenerWithCallback, engine)
     }
 
     private fun setLanguage(language: String?, result: Result) {
@@ -663,10 +660,13 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     private fun speak(text: String, focus: Boolean): Boolean {
         val uuid: String = UUID.randomUUID().toString()
+        Log.d(tag, "speak: $text, focus: $focus, uuid: $uuid")
         utterances[uuid] = text
         return if (ismServiceConnectionUsable(tts)) {
-            if(focus){
+            Log.d(tag, "speak: connection is usable")
+            if (focus) {
                 requestAudioFocus()
+                Log.d(tag, "speak: req focus")
             }
 
             if (silencems > 0) {
@@ -675,11 +675,12 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                     TextToSpeech.QUEUE_FLUSH,
                     SILENCE_PREFIX + uuid
                 )
-                tts!!.speak(text, TextToSpeech.QUEUE_ADD, bundle, uuid) == 0
+                tts!!.speak(text, TextToSpeech.QUEUE_ADD, bundle, uuid) == TextToSpeech.SUCCESS
             } else {
-                tts!!.speak(text, queueMode, bundle, uuid) == 0
+                tts!!.speak(text, queueMode, bundle, uuid) == TextToSpeech.SUCCESS
             }
         } else {
+            Log.d(tag, "speak: connection is not usable, init tts...")
             ttsStatus = null
             tts = TextToSpeech(context, onInitListenerWithoutCallback, selectedEngine)
             false

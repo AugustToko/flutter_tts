@@ -461,8 +461,8 @@ class FlutterTts {
 
   /// [Future] which invokes the platform specific method for setEngine
   /// ***Android supported only***
-  Future<dynamic> setEngine(String engine) async {
-    await _channel.invokeMethod('setEngine', engine);
+  Future<dynamic> setEngine(String engine) {
+    return _channel.invokeMethod('setEngine', engine);
   }
 
   /// [Future] which invokes the platform specific method for setPitch
